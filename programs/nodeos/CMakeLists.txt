@@ -64,6 +64,10 @@ if(TARGET sql_db_plugin)
   target_link_libraries( nodeos PRIVATE -Wl,${whole_archive_flag} sql_db_plugin -Wl,${no_whole_archive_flag} )
 endif()
 
+if(BUILD_ACCOUNT_SNAPSHOT_PLUGIN)
+  target_link_libraries( nodeos PRIVATE -Wl,${whole_archive_flag} account_snapshot_plugin -Wl,${no_whole_archive_flag} )
+endif()
+
 if(BUILD_MONGO_DB_PLUGIN)
   target_link_libraries( nodeos PRIVATE -Wl,${whole_archive_flag} mongo_db_plugin -Wl,${no_whole_archive_flag} )
 endif()

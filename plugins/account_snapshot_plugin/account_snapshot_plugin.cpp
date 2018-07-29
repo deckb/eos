@@ -58,7 +58,7 @@ namespace eosio {
       if (at.act.name == NEW_ACCOUNT) {
 	const auto create = at.act.data_as<chain::newaccount>();
 	//ilog("Created ${u}", ("u",create.name));
-	account_file << reinterpret_cast<const char*>(&at.elapsed) << create.name.to_string() << std::endl;
+	account_file << create.name.to_string() << std::endl;
 	account_file.flush();
       }
     }

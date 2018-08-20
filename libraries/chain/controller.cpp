@@ -231,7 +231,7 @@ struct controller_impl {
             std::cerr<< "\n";
             ilog( "${n} reversible blocks replayed", ("n",rev) );
             auto end = fc::time_point::now();
-            ilog( "replayed ${n} blocks in seconds, ${mspb} ms/block",
+            ilog( "replayed ${n} blocks in ${duration} seconds, ${mspb} ms/block",
                   ("n", head->block_num)("duration", (end-start).count()/1000000)
                   ("mspb", ((end-start).count()/1000.0)/head->block_num)        );
             std::cerr<< "\n";
@@ -467,7 +467,9 @@ struct controller_impl {
    transaction_trace_ptr apply_onerror( const generated_transaction& gtrx,
                                         fc::time_point deadline,
                                         fc::time_point start,
-                                        uint32_t billed_cpu_time_us) {
+                                        uint32_t& cpu_time_to_bill_us, // only set on failure
+                                        uint32_t billed_cpu_time_us,
+                                        bool explicit_billed_cpu_time = false ) {
       signed_transaction etrx;
       // Deliver onerror action containing the failed deferred transaction directly back to the sender.
       etrx.actions.emplace_back( vector<permission_level>{{gtrx.sender, config::active_name}},
@@ -477,6 +479,7 @@ struct controller_impl {
 
       transaction_context trx_context( self, etrx, etrx.id(), start );
       trx_context.deadline = deadline;
+      trx_context.explicit_billed_cpu_time = explicit_billed_cpu_time;
       trx_context.billed_cpu_time_us = billed_cpu_time_us;
       transaction_trace_ptr trace = trx_context.trace;
       try {
@@ -497,6 +500,7 @@ struct controller_impl {
          restore.cancel();
          return trace;
       } catch( const fc::exception& e ) {
+         cpu_time_to_bill_us = trx_context.update_billed_cpu_time( fc::time_point::now() );
          trace->except = e;
          trace->except_ptr = std::current_exception();
       }
@@ -513,7 +517,7 @@ struct controller_impl {
       db.remove( gto );
    }
 
-   bool failure_is_subjective( const fc::exception& e ) {
+   bool failure_is_subjective( const fc::exception& e ) const {
       auto code = e.code();
       return    (code == subjective_block_production_exception::code_value)
              || (code == block_net_usage_exceeded::code_value)
@@ -529,14 +533,20 @@ struct controller_impl {
              || (code == key_blacklist_exception::code_value);
    }
 
-   transaction_trace_ptr push_scheduled_transaction( const transaction_id_type& trxid, fc::time_point deadline, uint32_t billed_cpu_time_us ) {
+   bool scheduled_failure_is_subjective( const fc::exception& e ) const {
+      auto code = e.code();
+      return    (code == tx_cpu_usage_exceeded::code_value)
+             || failure_is_subjective(e);
+   }
+
+   transaction_trace_ptr push_scheduled_transaction( const transaction_id_type& trxid, fc::time_point deadline, uint32_t billed_cpu_time_us, bool explicit_billed_cpu_time = false ) {
       const auto& idx = db.get_index<generated_transaction_multi_index,by_trx_id>();
       auto itr = idx.find( trxid );
       EOS_ASSERT( itr != idx.end(), unknown_transaction_exception, "unknown transaction" );
-      return push_scheduled_transaction( *itr, deadline, billed_cpu_time_us );
+      return push_scheduled_transaction( *itr, deadline, billed_cpu_time_us, explicit_billed_cpu_time );
    }
 
-   transaction_trace_ptr push_scheduled_transaction( const generated_transaction_object& gto, fc::time_point deadline, uint32_t billed_cpu_time_us )
+   transaction_trace_ptr push_scheduled_transaction( const generated_transaction_object& gto, fc::time_point deadline, uint32_t billed_cpu_time_us, bool explicit_billed_cpu_time = false )
    { try {
       auto undo_session = db.start_undo_session(true);
       auto gtrx = generated_transaction(gto);
@@ -572,14 +582,16 @@ struct controller_impl {
       });
       in_trx_requiring_checks = true;
 
+      uint32_t cpu_time_to_bill_us = billed_cpu_time_us;
+
       transaction_context trx_context( self, dtrx, gtrx.trx_id );
+      trx_context.leeway =  fc::microseconds(0); // avoid stealing cpu resource
       trx_context.deadline = deadline;
+      trx_context.explicit_billed_cpu_time = explicit_billed_cpu_time;
       trx_context.billed_cpu_time_us = billed_cpu_time_us;
       transaction_trace_ptr trace = trx_context.trace;
-      flat_set<account_name>  bill_to_accounts;
       try {
          trx_context.init_for_deferred_trx( gtrx.published );
-         bill_to_accounts = trx_context.bill_to_accounts;
          trx_context.exec();
          trx_context.finalize(); // Automatically rounds up network and CPU usage in trace and bills payers if successful
 
@@ -599,35 +611,56 @@ struct controller_impl {
          restore.cancel();
          return trace;
       } catch( const fc::exception& e ) {
+         cpu_time_to_bill_us = trx_context.update_billed_cpu_time( fc::time_point::now() );
          trace->except = e;
          trace->except_ptr = std::current_exception();
          trace->elapsed = fc::time_point::now() - trx_context.start;
       }
       trx_context.undo_session.undo();
 
-      // Only soft or hard failure logic below:
+      // Only subjective OR soft OR hard failure logic below:
 
       if( gtrx.sender != account_name() && !failure_is_subjective(*trace->except)) {
          // Attempt error handling for the generated transaction.
          dlog("${detail}", ("detail", trace->except->to_detail_string()));
-         auto error_trace = apply_onerror( gtrx, deadline, trx_context.start, trx_context.billed_cpu_time_us );
+         auto error_trace = apply_onerror( gtrx, deadline, trx_context.pseudo_start, cpu_time_to_bill_us, billed_cpu_time_us, explicit_billed_cpu_time );
          error_trace->failed_dtrx_trace = trace;
          trace = error_trace;
          if( !trace->except_ptr ) {
             undo_session.squash();
             return trace;
          }
+         trace->elapsed = fc::time_point::now() - trx_context.start;
       }
 
-      // Only hard failure OR subjective failure logic below:
+      // Only subjective OR hard failure logic below:
 
-      trace->elapsed = fc::time_point::now() - trx_context.start;
+      // subjectivity changes based on producing vs validating
+      bool subjective  = false;
+      if (explicit_billed_cpu_time) {
+         subjective = failure_is_subjective(*trace->except);
+      } else {
+         subjective = scheduled_failure_is_subjective(*trace->except);
+      }
 
-      resource_limits.add_transaction_usage( bill_to_accounts, trx_context.billed_cpu_time_us, 0,
-                                             block_timestamp_type(self.pending_block_time()).slot ); // Should never fail
+      if ( !subjective ) {
+         // hard failure logic
 
-      if (!failure_is_subjective(*trace->except)) {
-         trace->receipt = push_receipt(gtrx.trx_id, transaction_receipt::hard_fail, trx_context.billed_cpu_time_us, 0);
+         if( !explicit_billed_cpu_time ) {
+            auto& rl = self.get_mutable_resource_limits_manager();
+            rl.update_account_usage( trx_context.bill_to_accounts, block_timestamp_type(self.pending_block_time()).slot );
+            int64_t account_cpu_limit = 0;
+            std::tie( std::ignore, account_cpu_limit, std::ignore ) = trx_context.max_bandwidth_billed_accounts_can_pay( true );
+
+            cpu_time_to_bill_us = static_cast<uint32_t>( std::min( std::min( static_cast<int64_t>(cpu_time_to_bill_us),
+                                                                             account_cpu_limit                          ),
+                                                                   trx_context.initial_objective_duration_limit.count()    ) );
+         }
+
+         resource_limits.add_transaction_usage( trx_context.bill_to_accounts, cpu_time_to_bill_us, 0,
+                                                block_timestamp_type(self.pending_block_time()).slot ); // Should never fail
+
+         trace->receipt = push_receipt(gtrx.trx_id, transaction_receipt::hard_fail, cpu_time_to_bill_us, 0);
          emit( self.applied_transaction, trace );
          undo_session.squash();
       }
@@ -660,7 +693,8 @@ struct controller_impl {
    transaction_trace_ptr push_transaction( const transaction_metadata_ptr& trx,
                                            fc::time_point deadline,
                                            bool implicit,
-                                           uint32_t billed_cpu_time_us)
+                                           uint32_t billed_cpu_time_us,
+                                           bool explicit_billed_cpu_time = false )
    {
       EOS_ASSERT(deadline != fc::time_point(), transaction_exception, "deadline cannot be uninitialized");
 
@@ -671,6 +705,7 @@ struct controller_impl {
             trx_context.leeway = *subjective_cpu_leeway;
          }
          trx_context.deadline = deadline;
+         trx_context.explicit_billed_cpu_time = explicit_billed_cpu_time;
          trx_context.billed_cpu_time_us = billed_cpu_time_us;
          trace = trx_context.trace;
          try {
@@ -761,7 +796,7 @@ struct controller_impl {
    void start_block( block_timestamp_type when, uint16_t confirm_block_count, controller::block_status s ) {
       EOS_ASSERT( !pending, block_validate_exception, "pending block is not available" );
 
-      EOS_ASSERT( db.revision() == head->block_num, database_exception, "db revision is not on par with head block", 
+      EOS_ASSERT( db.revision() == head->block_num, database_exception, "db revision is not on par with head block",
                 ("db.revision()", db.revision())("controller_head_block", head->block_num)("fork_db_head_block", fork_db.head()->block_num) );
 
       auto guard_pending = fc::make_scoped_exit([this](){
@@ -809,7 +844,7 @@ struct controller_impl {
                   in_trx_requiring_checks = old_value;
                });
             in_trx_requiring_checks = true;
-            push_transaction( onbtrx, fc::time_point::maximum(), true, self.get_global_properties().configuration.min_transaction_cpu_usage );
+            push_transaction( onbtrx, fc::time_point::maximum(), true, self.get_global_properties().configuration.min_transaction_cpu_usage, true );
          } catch( const boost::interprocess::bad_alloc& e  ) {
             elog( "on block transaction failed due to a bad allocation" );
             throw;
@@ -828,10 +863,10 @@ struct controller_impl {
 
 
 
-   void sign_block( const std::function<signature_type( const digest_type& )>& signer_callback, bool trust  ) {
+   void sign_block( const std::function<signature_type( const digest_type& )>& signer_callback  ) {
       auto p = pending->_pending_block_state;
 
-      p->sign( signer_callback, false); //trust );
+      p->sign( signer_callback );
 
       static_cast<signed_block_header&>(*p->block) = p->header;
    } /// sign_block
@@ -848,9 +883,9 @@ struct controller_impl {
             if( receipt.trx.contains<packed_transaction>() ) {
                auto& pt = receipt.trx.get<packed_transaction>();
                auto mtrx = std::make_shared<transaction_metadata>(pt);
-               trace = push_transaction( mtrx, fc::time_point::maximum(), false, receipt.cpu_usage_us);
+               trace = push_transaction( mtrx, fc::time_point::maximum(), false, receipt.cpu_usage_us, true );
             } else if( receipt.trx.contains<transaction_id_type>() ) {
-               trace = push_scheduled_transaction( receipt.trx.get<transaction_id_type>(), fc::time_point::maximum(), receipt.cpu_usage_us );
+               trace = push_scheduled_transaction( receipt.trx.get<transaction_id_type>(), fc::time_point::maximum(), receipt.cpu_usage_us, true );
             } else {
                EOS_ASSERT( false, block_validate_exception, "encountered unexpected receipt type" );
             }
@@ -877,11 +912,21 @@ struct controller_impl {
          }
 
          finalize_block();
-         sign_block( [&]( const auto& ){ return b->producer_signature; }, false ); //trust );
 
-         // this is implied by the signature passing
-         //FC_ASSERT( b->id() == pending->_pending_block_state->block->id(),
-         //           "applying block didn't produce expected block id" );
+         // this implicitly asserts that all header fields (less the signature) are identical
+         EOS_ASSERT(b->id() == pending->_pending_block_state->header.id(),
+                   block_validate_exception, "Block ID does not match",
+                   ("producer_block_id",b->id())("validator_block_id",pending->_pending_block_state->header.id()));
+
+         // We need to fill out the pending block state's block because that gets serialized in the reversible block log
+         // in the future we can optimize this by serializing the original and not the copy
+
+         // we can always trust this signature because,
+         //   - prior to apply_block, we call fork_db.add which does a signature check IFF the block is untrusted
+         //   - OTHERWISE the block is trusted and therefore we trust that the signature is valid
+         // Also, as ::sign_block does not lazily calculate the digest of the block, we can just short-circuit to save cycles
+         pending->_pending_block_state->header.producer_signature = b->producer_signature;
+         static_cast<signed_block_header&>(*pending->_pending_block_state->block) =  pending->_pending_block_state->header;
 
          commit_block(false);
          return;
@@ -1274,7 +1319,7 @@ void controller::finalize_block() {
 }
 
 void controller::sign_block( const std::function<signature_type( const digest_type& )>& signer_callback ) {
-   my->sign_block( signer_callback, false /* don't trust */);
+   my->sign_block( signer_callback );
 }
 
 void controller::commit_block() {
@@ -1300,13 +1345,13 @@ void controller::push_confirmation( const header_confirmation& c ) {
 
 transaction_trace_ptr controller::push_transaction( const transaction_metadata_ptr& trx, fc::time_point deadline, uint32_t billed_cpu_time_us ) {
    validate_db_available_size();
-   return my->push_transaction(trx, deadline, false, billed_cpu_time_us);
+   return my->push_transaction(trx, deadline, false, billed_cpu_time_us, billed_cpu_time_us > 0 );
 }
 
 transaction_trace_ptr controller::push_scheduled_transaction( const transaction_id_type& trxid, fc::time_point deadline, uint32_t billed_cpu_time_us )
 {
    validate_db_available_size();
-   return my->push_scheduled_transaction( trxid, deadline, billed_cpu_time_us );
+   return my->push_scheduled_transaction( trxid, deadline, billed_cpu_time_us, billed_cpu_time_us > 0 );
 }
 
 uint32_t controller::head_block_num()const {

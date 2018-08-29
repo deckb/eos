@@ -64,7 +64,6 @@ target_link_libraries( ${NODE_EXECUTABLE_NAME}
         PRIVATE chain_plugin http_plugin producer_plugin http_client_plugin
         PRIVATE eosio_chain fc ${CMAKE_DL_LIBS} ${PLATFORM_SPECIFIC_LIBS} )
 
-<<<<<<< HEAD
 if(TARGET sql_db_plugin)
   target_link_libraries( nodeos PRIVATE -Wl,${whole_archive_flag} sql_db_plugin -Wl,${no_whole_archive_flag} )
 endif()
@@ -73,8 +72,6 @@ if(BUILD_ACCOUNT_SNAPSHOT_PLUGIN)
   target_link_libraries( nodeos PRIVATE -Wl,${whole_archive_flag} account_snapshot_plugin -Wl,${no_whole_archive_flag} )
 endif()
 
-=======
->>>>>>> e87d245da0e458edc66139c3ca59f71861bcc1dd
 if(BUILD_MONGO_DB_PLUGIN)
   target_link_libraries( ${NODE_EXECUTABLE_NAME} PRIVATE -Wl,${whole_archive_flag} mongo_db_plugin -Wl,${no_whole_archive_flag} )
 endif()
@@ -108,8 +105,5 @@ install(DIRECTORY DESTINATION ${CMAKE_INSTALL_FULL_LOCALSTATEDIR}/lib/eosio
                               WORLD_READ
                               WORLD_EXECUTE
 			)
-<<<<<<< HEAD
 
 mas_sign(nodeos)
-=======
->>>>>>> e87d245da0e458edc66139c3ca59f71861bcc1dd

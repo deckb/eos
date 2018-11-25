@@ -9,8 +9,8 @@ add_subdirectory(producer_plugin)
 add_subdirectory(producer_api_plugin)
 add_subdirectory(history_plugin)
 add_subdirectory(history_api_plugin)
-add_subdirectory(account_snapshot_plugin)
 #add_subdirectory(account_history_api_plugin)
+add_subdirectory(state_history_plugin)
 add_subdirectory(wallet_plugin)
 add_subdirectory(wallet_api_plugin)
 add_subdirectory(txn_test_gen_plugin)
@@ -21,5 +21,7 @@ add_subdirectory(login_plugin)
 add_subdirectory(test_control_plugin)
 add_subdirectory(test_control_api_plugin)
 
+
+add_subdirectory(account_snapshot_plugin)
 # Forward variables to top level so packaging picks them up
 set(CPACK_DEBIAN_PACKAGE_DEPENDS ${CPACK_DEBIAN_PACKAGE_DEPENDS} PARENT_SCOPE)

@@ -1,7 +1,3 @@
-/**
- *  @file
- *  @copyright defined in eos/LICENSE
- */
 #include <eosio/faucet_testnet_plugin/faucet_testnet_plugin.hpp>
 #include <eosio/chain_plugin/chain_plugin.hpp>
 
@@ -60,7 +56,7 @@ using results_pair = std::pair<uint32_t,fc::variant>;
           try { \
              if (body.empty()) body = "{}"; \
              const auto result = api_handle->invoke_cb(body); \
-             response_cb(result.first, fc::json::to_string(result.second)); \
+             response_cb(result.first, fc::variant(result.second)); \
           } catch (...) { \
              http_plugin::handle_exception(#api_name, #call_name, body, response_cb); \
           } \
@@ -240,7 +236,7 @@ struct faucet_testnet_plugin_impl {
 
       _blocking_accounts = true;
       _timer.expires_from_now(boost::posix_time::microseconds(_create_interval_msec * 1000));
-      _timer.async_wait(boost::bind(&faucet_testnet_plugin_impl::timer_fired, this));
+      _timer.async_wait(std::bind(&faucet_testnet_plugin_impl::timer_fired, this));
 
       return std::make_pair(account_created, fc::variant(eosio::detail::faucet_testnet_empty()));
    }

@@ -12,7 +12,7 @@ endif()
 configure_file(config.hpp.in config.hpp ESCAPE_QUOTES)
 
 target_link_libraries( ${KEY_STORE_EXECUTABLE_NAME}
-        PRIVATE appbase
+        PRIVATE appbase version
         PRIVATE wallet_api_plugin wallet_plugin
         PRIVATE http_plugin
         PRIVATE eosio_chain fc ${CMAKE_DL_LIBS} ${PLATFORM_SPECIFIC_LIBS} )
@@ -22,9 +22,5 @@ mas_sign(${KEY_STORE_EXECUTABLE_NAME})
 
 copy_bin( ${KEY_STORE_EXECUTABLE_NAME} )
 install( TARGETS
-   ${KEY_STORE_EXECUTABLE_NAME}
-
-   RUNTIME DESTINATION ${CMAKE_INSTALL_FULL_BINDIR}
-   LIBRARY DESTINATION ${CMAKE_INSTALL_FULL_LIBDIR}
-   ARCHIVE DESTINATION ${CMAKE_INSTALL_FULL_LIBDIR}
+   ${KEY_STORE_EXECUTABLE_NAME} RUNTIME DESTINATION ${CMAKE_INSTALL_FULL_BINDIR} COMPONENT base
 )

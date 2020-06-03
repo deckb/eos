@@ -9,8 +9,7 @@
 #include <eosio/chain/wast_to_wasm.hpp>
 #include <eosio/chain_plugin/chain_plugin.hpp>
 
-#include <asserter/asserter.wast.hpp>
-#include <asserter/asserter.abi.hpp>
+#include <contracts.hpp>
 
 #include <fc/io/fstream.hpp>
 
@@ -42,8 +41,8 @@ BOOST_FIXTURE_TEST_CASE( get_block_with_invalid_abi, TESTER ) try {
    produce_block();
 
    // setup contract and abi
-   set_code(N(asserter), asserter_wast);
-   set_abi(N(asserter), asserter_abi);
+   set_code( N(asserter), contracts::asserter_wasm() );
+   set_abi( N(asserter), contracts::asserter_abi().data() );
    produce_blocks(1);
 
    auto resolver = [&,this]( const account_name& name ) -> optional<abi_serializer> {
@@ -51,7 +50,7 @@ BOOST_FIXTURE_TEST_CASE( get_block_with_invalid_abi, TESTER ) try {
          const auto& accnt  = this->control->db().get<account_object,by_name>( name );
          abi_def abi;
          if (abi_serializer::to_abi(accnt.abi, abi)) {
-            return abi_serializer(abi, abi_serializer_max_time);
+            return abi_serializer(abi, abi_serializer::create_yield_function( abi_serializer_max_time ));
          }
          return optional<abi_serializer>();
       } FC_RETHROW_EXCEPTIONS(error, "resolver failed at chain_plugin_tests::abi_invalid_type");
@@ -78,7 +77,7 @@ BOOST_FIXTURE_TEST_CASE( get_block_with_invalid_abi, TESTER ) try {
          })
       );
    signed_transaction trx;
-   abi_serializer::from_variant(pretty_trx, trx, resolver, abi_serializer_max_time);
+   abi_serializer::from_variant(pretty_trx, trx, resolver, abi_serializer::create_yield_function( abi_serializer_max_time ));
    set_transaction_headers(trx);
    trx.sign( get_private_key( N(asserter), "active" ), control->get_chain_id() );
    push_transaction( trx );
@@ -90,7 +89,7 @@ BOOST_FIXTURE_TEST_CASE( get_block_with_invalid_abi, TESTER ) try {
    char headnumstr[20];
    sprintf(headnumstr, "%d", headnum);
    chain_apis::read_only::get_block_params param{headnumstr};
-   chain_apis::read_only plugin(*(this->control), fc::microseconds(INT_MAX));
+   chain_apis::read_only plugin(*(this->control), fc::microseconds::maximum());
 
    // block should be decoded successfully
    std::string block_str = json::to_pretty_string(plugin.get_block(param));
@@ -100,7 +99,7 @@ BOOST_FIXTURE_TEST_CASE( get_block_with_invalid_abi, TESTER ) try {
    BOOST_TEST(block_str.find("011253686f756c64204e6f742041737365727421") != std::string::npos); //action data
 
    // set an invalid abi (int8->xxxx)
-   std::string abi2 = asserter_abi;
+   std::string abi2 = contracts::asserter_abi().data();
    auto pos = abi2.find("int8");
    BOOST_TEST(pos != std::string::npos);
    abi2.replace(pos, 4, "xxxx");
@@ -120,4 +119,3 @@ BOOST_FIXTURE_TEST_CASE( get_block_with_invalid_abi, TESTER ) try {
 } FC_LOG_AND_RETHROW() /// get_block_with_invalid_abi
 
 BOOST_AUTO_TEST_SUITE_END()
-

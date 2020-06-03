@@ -1,15 +1,15 @@
-/**
- *  @file
- *  @copyright defined in eos/LICENSE
- */
 #include <eosio/http_plugin/http_plugin.hpp>
+#ifdef BOOST_ASIO_HAS_LOCAL_SOCKETS
 #include <eosio/http_plugin/local_endpoint.hpp>
+#endif
 #include <eosio/chain/exceptions.hpp>
+#include <eosio/chain/thread_utils.hpp>
 
 #include <fc/network/ip.hpp>
 #include <fc/log/logger_config.hpp>
 #include <fc/reflect/variant.hpp>
 #include <fc/io/json.hpp>
+#include <fc/io/raw.hpp>
 #include <fc/crypto/openssl.hpp>
 
 #include <boost/asio.hpp>
@@ -25,6 +25,9 @@
 #include <thread>
 #include <memory>
 #include <regex>
+
+const fc::string logger_name("http_plugin");
+fc::logger logger;
 
 namespace eosio {
 
@@ -43,6 +46,11 @@ namespace eosio {
    using boost::asio::ip::address_v6;
    using std::shared_ptr;
    using websocketpp::connection_hdl;
+
+   enum https_ecdh_curve_t {
+      SECP384R1,
+      PRIME256V1
+   };
 
    static http_plugin_defaults current_http_plugin_defaults;
 
@@ -86,6 +94,7 @@ namespace eosio {
           static const long timeout_open_handshake = 0;
       };
 
+#ifdef BOOST_ASIO_HAS_LOCAL_SOCKETS
       struct asio_local_with_stub_log : public websocketpp::config::asio {
           typedef asio_local_with_stub_log type;
           typedef asio base;
@@ -117,10 +126,54 @@ namespace eosio {
 
           static const long timeout_open_handshake = 0;
       };
+#endif
+      /**
+       * virtualized wrapper for the various underlying connection functions needed in req/resp processng
+       */
+      struct abstract_conn {
+         virtual ~abstract_conn() {}
+         virtual bool verify_max_bytes_in_flight() = 0;
+         virtual void handle_exception() = 0;
+      };
+
+      using abstract_conn_ptr = std::shared_ptr<abstract_conn>;
+
+      template<typename T>
+      using connection_ptr = typename websocketpp::server<T>::connection_ptr;
+
+      /**
+       * internal url handler that contains more parameters than the handlers provided by external systems
+       */
+      using internal_url_handler = std::function<void(abstract_conn_ptr, string, string, url_response_callback)>;
+
+      /**
+       * Helper method to calculate the "in flight" size of a string
+       * @param s - the string
+       * @return in flight size of s
+       */
+      static size_t in_flight_sizeof( const string& s ) {
+         return s.size();
+      }
+
+      /**
+       * Helper method to calculate the "in flight" size of a fc::variant
+       * This is an estimate based on fc::raw::pack if that process can be successfully executed
+       *
+       * @param v - the fc::variant
+       * @return in flight size of v
+       */
+      static size_t in_flight_sizeof( const fc::variant& v ) {
+         try {
+            return fc::raw::pack_size( v );
+         } catch(...) {}
+         return 0;
+      }
    }
 
    using websocket_server_type = websocketpp::server<detail::asio_with_stub_log<websocketpp::transport::asio::basic_socket::endpoint>>;
+#ifdef BOOST_ASIO_HAS_LOCAL_SOCKETS
    using websocket_local_server_type = websocketpp::server<detail::asio_local_with_stub_log>;
+#endif
    using websocket_server_tls_type =  websocketpp::server<detail::asio_with_stub_log<websocketpp::transport::asio::tls_socket::endpoint>>;
    using ssl_context_ptr =  websocketpp::lib::shared_ptr<websocketpp::lib::asio::ssl::context>;
 
@@ -128,31 +181,37 @@ namespace eosio {
 
    class http_plugin_impl {
       public:
-         map<string,url_handler>  url_handlers;
+         // key -> priority, url_handler
+         map<string,detail::internal_url_handler>  url_handlers;
          optional<tcp::endpoint>  listen_endpoint;
          string                   access_control_allow_origin;
          string                   access_control_allow_headers;
          string                   access_control_max_age;
          bool                     access_control_allow_credentials = false;
-         size_t                   max_body_size;
+         size_t                   max_body_size{1024*1024};
 
          websocket_server_type    server;
+
+         uint16_t                                    thread_pool_size = 2;
+         optional<eosio::chain::named_thread_pool>   thread_pool;
+         std::atomic<size_t>                         bytes_in_flight{0};
+         size_t                                      max_bytes_in_flight = 0;
+         fc::microseconds                            max_response_time{30*1000};
 
          optional<tcp::endpoint>  https_listen_endpoint;
          string                   https_cert_chain;
          string                   https_key;
+         https_ecdh_curve_t       https_ecdh_curve = SECP384R1;
 
          websocket_server_tls_type https_server;
 
+#ifdef BOOST_ASIO_HAS_LOCAL_SOCKETS
          optional<asio::local::stream_protocol::endpoint> unix_endpoint;
          websocket_local_server_type unix_server;
+#endif
 
          bool                     validate_host;
          set<string>              valid_hosts;
-
-         string                   unix_socket_path_option_name     = "unix-socket-path";
-         string                   http_server_address_option_name  = "http-server-address";
-         string                   https_server_address_option_name = "https-server-address";
 
          bool host_port_is_valid( const std::string& header_host_port, const string& endpoint_local_host_port ) {
             return !validate_host || header_host_port == endpoint_local_host_port || valid_hosts.find(header_host_port) != valid_hosts.end();
@@ -189,7 +248,7 @@ namespace eosio {
 
                //going for the A+! Do a few more things on the native context to get ECDH in use
 
-               fc::ec_key ecdh = EC_KEY_new_by_curve_name(NID_secp384r1);
+               fc::ec_key ecdh = EC_KEY_new_by_curve_name(https_ecdh_curve == SECP384R1 ? NID_secp384r1 : NID_X9_62_prime256v1);
                if (!ecdh)
                   EOS_THROW(chain::http_exception, "Failed to set NID_secp384r1");
                if(SSL_CTX_set_tmp_ecdh(ctx->native_handle(), (EC_KEY*)ecdh) != 1)
@@ -200,48 +259,57 @@ namespace eosio {
                   "!DHE:!RSA:!AES128:!RC4:!DES:!3DES:!DSS:!SRP:!PSK:!EXP:!MD5:!LOW:!aNULL:!eNULL") != 1)
                   EOS_THROW(chain::http_exception, "Failed to set HTTPS cipher list");
             } catch (const fc::exception& e) {
-               elog("https server initialization error: ${w}", ("w", e.to_detail_string()));
+               fc_elog( logger, "https server initialization error: ${w}", ("w", e.to_detail_string()) );
             } catch(std::exception& e) {
-               elog("https server initialization error: ${w}", ("w", e.what()));
+               fc_elog( logger, "https server initialization error: ${w}", ("w", e.what()) );
             }
 
             return ctx;
          }
 
          template<class T>
-         static void handle_exception(typename websocketpp::server<T>::connection_ptr con) {
+         static void handle_exception(detail::connection_ptr<T> con) {
             string err = "Internal Service error, http: ";
+            const auto deadline = fc::time_point::now() + fc::exception::format_time_limit;
             try {
                con->set_status( websocketpp::http::status_code::internal_server_error );
                try {
                   throw;
                } catch (const fc::exception& e) {
                   err += e.to_detail_string();
-                  elog( "${e}", ("e", err));
+                  fc_elog( logger, "${e}", ("e", err));
                   error_results results{websocketpp::http::status_code::internal_server_error,
-                                        "Internal Service Error", error_results::error_info(e, verbose_http_errors )};
-                  con->set_body( fc::json::to_string( results ));
+                                        "Internal Service Error", error_results::error_info( e, verbose_http_errors )};
+                  con->set_body( fc::json::to_string( results, deadline ));
                } catch (const std::exception& e) {
                   err += e.what();
-                  elog( "${e}", ("e", err));
+                  fc_elog( logger, "${e}", ("e", err));
                   error_results results{websocketpp::http::status_code::internal_server_error,
-                                        "Internal Service Error", error_results::error_info(fc::exception( FC_LOG_MESSAGE( error, e.what())), verbose_http_errors )};
-                  con->set_body( fc::json::to_string( results ));
+                                        "Internal Service Error",
+                                        error_results::error_info( fc::exception( FC_LOG_MESSAGE( error, e.what())),
+                                                                   verbose_http_errors )};
+                  con->set_body( fc::json::to_string( results, deadline ));
                } catch (...) {
                   err += "Unknown Exception";
                   error_results results{websocketpp::http::status_code::internal_server_error,
                                         "Internal Service Error",
-                                        error_results::error_info(fc::exception( FC_LOG_MESSAGE( error, "Unknown Exception" )), verbose_http_errors )};
-                  con->set_body( fc::json::to_string( results ));
+                                        error_results::error_info(
+                                              fc::exception( FC_LOG_MESSAGE( error, "Unknown Exception" )),
+                                              verbose_http_errors )};
+                  con->set_body( fc::json::to_string( results, deadline ));
                }
+            } catch (fc::timeout_exception& e) {
+               con->set_body( R"xxx({"message": "Internal Server Error"})xxx" );
+               fc_elog( logger, "Timeout exception ${te} attempting to handle exception: ${e}", ("te", e.to_detail_string())("e", err) );
             } catch (...) {
                con->set_body( R"xxx({"message": "Internal Server Error"})xxx" );
-               std::cerr << "Exception attempting to handle exception: " << err << std::endl;
+               fc_elog( logger, "Exception attempting to handle exception: ${e}", ("e", err) );
             }
+            con->send_http_response();
          }
 
          template<class T>
-         bool allow_host(const typename T::request_type& req, typename websocketpp::server<T>::connection_ptr con) {
+         bool allow_host(const typename T::request_type& req, detail::connection_ptr<T> con) {
             bool is_secure = con->get_uri()->get_secure();
             const auto& local_endpoint = con->get_socket().lowest_layer().local_endpoint();
             auto local_socket_host_port = local_endpoint.address().to_string() + ":" + std::to_string(local_endpoint.port());
@@ -254,8 +322,214 @@ namespace eosio {
             return true;
          }
 
+         template<typename T>
+         bool verify_max_bytes_in_flight( const T& con ) {
+            auto bytes_in_flight_size = bytes_in_flight.load();
+            if( bytes_in_flight_size > max_bytes_in_flight ) {
+               fc_dlog( logger, "429 - too many bytes in flight: ${bytes}", ("bytes", bytes_in_flight_size) );
+               error_results::error_info ei;
+               ei.code = websocketpp::http::status_code::too_many_requests;
+               ei.name = "Busy";
+               ei.what = "Too many bytes in flight: " + std::to_string( bytes_in_flight_size );
+               error_results results{websocketpp::http::status_code::too_many_requests, "Busy", ei};
+               con->set_body( fc::json::to_string( results, fc::time_point::maximum() ));
+               con->set_status( websocketpp::http::status_code::too_many_requests );
+               con->send_http_response();
+               return false;
+            }
+            return true;
+         }
+
+         /**
+          * child struct, implementing abstract connection for various underlying connection types
+          * that ties it to an http_plugin_impl
+          *
+          * @tparam T - The downstream parameter for the connection_ptr
+          */
+         template<typename T>
+         struct abstract_conn_impl : public detail::abstract_conn {
+            abstract_conn_impl(detail::connection_ptr<T> conn, http_plugin_impl& impl)
+            :_conn(std::move(conn))
+            ,_impl(impl)
+            {}
+
+            ~abstract_conn_impl() = default;
+            abstract_conn_impl(abstract_conn_impl&&) = default;
+            abstract_conn_impl& operator=(abstract_conn_impl&&) noexcept = default;
+
+            bool verify_max_bytes_in_flight() override {
+               return _impl.verify_max_bytes_in_flight(_conn);
+            }
+
+            void handle_exception()override {
+               http_plugin_impl::handle_exception<T>(_conn);
+            }
+
+            detail::connection_ptr<T> _conn;
+            http_plugin_impl &_impl;
+         };
+
+         /**
+          * Helper to construct an abstract_conn_impl for a given connection and instance of http_plugin_impl
+          * @tparam T - The downstream parameter for the connection_ptr
+          * @param conn - existing connection_ptr<T>
+          * @param impl - reference to the ownint http_plugin_impl
+          * @return abstract_conn_ptr backed by type specific implementations of the methods
+          */
+         template<typename T>
+         static detail::abstract_conn_ptr make_abstract_conn_ptr( detail::connection_ptr<T> conn, http_plugin_impl& impl ) {
+            return std::make_shared<abstract_conn_impl<T>>(conn, impl);
+         }
+
+         /**
+          * Helper type that wraps an object of type T and records its "in flight" size to
+          * http_plugin_impl::bytes_in_flight using RAII semantics
+          *
+          * @tparam T - the contained Type
+          */
+         template<typename T>
+         struct in_flight {
+            in_flight(T&& object, http_plugin_impl& impl)
+            :object(std::move(object))
+            ,impl(impl)
+            {
+               count = detail::in_flight_sizeof(object);
+               impl.bytes_in_flight += count;
+            }
+
+            ~in_flight() {
+               if (count) {
+                  impl.bytes_in_flight -= count;
+               }
+            }
+
+            // No copy constructor, but allow move
+            in_flight(const in_flight&) = delete;
+            in_flight(in_flight&& from)
+            :object(std::move(from.object))
+            ,count(from.count)
+            ,impl(from.impl)
+            {
+               from.count = 0;
+            }
+
+            // No copy assignment, but allow move
+            in_flight& operator=(const in_flight&) = delete;
+            in_flight& operator=(in_flight&& from) {
+               object = std::move(from.object);
+               count = from.count;
+               impl = from.impl;
+               from.count = 0;
+            }
+
+            /**
+             * const accessor
+             * @return const reference to the contained object
+             */
+            const T& operator* () const {
+               return object;
+            }
+
+            /**
+             * mutable accessor (can be moved frmo)
+             * @return mutable reference to the contained object
+             */
+            T& operator* () {
+               return object;
+            }
+
+            T object;
+            size_t count;
+            http_plugin_impl& impl;
+         };
+
+         /**
+          * convenient wrapper to make an in_flight<T>
+          */
+         template<typename T>
+         static auto make_in_flight(T&& object, http_plugin_impl& impl) {
+            return in_flight<T>(std::forward<T>(object), impl);
+         }
+
+         /**
+          * Make an internal_url_handler that will run the url_handler on the app() thread and then
+          * return to the http thread pool for response processing
+          *
+          * @pre b.size() has been added to bytes_in_flight by caller
+          * @param priority - priority to post to the app thread at
+          * @param next - the next handler for responses
+          * @return the constructed internal_url_handler
+          */
+         detail::internal_url_handler make_app_thread_url_handler( int priority, url_handler next ) {
+            auto next_ptr = std::make_shared<url_handler>(std::move(next));
+            return [this, priority, next_ptr=std::move(next_ptr)]( detail::abstract_conn_ptr conn, string r, string b, url_response_callback then ) mutable {
+               auto tracked_b = make_in_flight(std::move(b), *this);
+               if (!conn->verify_max_bytes_in_flight()) {
+                  return;
+               }
+
+               // post to the app thread taking shared ownership of next (via std::shared_ptr),
+               // sole ownership of the tracked body and the passed in parameters
+               app().post( priority, [next_ptr, conn=std::move(conn), r=std::move(r), tracked_b=std::move(tracked_b), then=std::move(then)]() mutable {
+                  try {
+                     // call the `next` url_handler and wrap the response handler
+                     (*next_ptr)( std::move( r ), std::move( *tracked_b ), std::move(then)) ;
+                  } catch( ... ) {
+                     conn->handle_exception();
+                  }
+               } );
+            };
+         }
+
+         /**
+          * Make an internal_url_handler that will run the url_handler directly
+          *
+          * @pre b.size() has been added to bytes_in_flight by caller
+          * @param next - the next handler for responses
+          * @return the constructed internal_url_handler
+          */
+         detail::internal_url_handler make_http_thread_url_handler(url_handler next) {
+            return [next=std::move(next)]( detail::abstract_conn_ptr conn, string r, string b, url_response_callback then ) {
+               try {
+                  next(std::move(r), std::move(b), std::move(then));
+               } catch( ... ) {
+                  conn->handle_exception();
+               }
+             };
+         }
+
+         /**
+          * Construct a lambda appropriate for url_response_callback that will
+          * JSON-stringify the provided response
+          *
+          * @param con - pointer for the connection this response should be sent to
+          * @return lambda suitable for url_response_callback
+          */
+         template<typename T>
+         auto make_http_response_handler( detail::connection_ptr<T> con ) {
+            return [this, con]( int code, fc::variant response ) {
+               auto tracked_response = make_in_flight(std::move(response), *this);
+               if (!verify_max_bytes_in_flight(con)) {
+                  return;
+               }
+
+               // post  back to an HTTP thread to to allow the response handler to be called from any thread
+               boost::asio::post( thread_pool->get_executor(), [this, con, code, tracked_response=std::move(tracked_response)]() {
+                  try {
+                     std::string json = fc::json::to_string( *tracked_response, fc::time_point::now() + max_response_time );
+                     auto tracked_json = make_in_flight(std::move(json), *this);
+                     con->set_body( std::move( *tracked_json ) );
+                     con->set_status( websocketpp::http::status_code::value( code ) );
+                     con->send_http_response();
+                  } catch( ... ) {
+                     handle_exception<T>( con );
+                  }
+               });
+            };
+         }
+
          template<class T>
-         void handle_http_request(typename websocketpp::server<T>::connection_ptr con) {
+         void handle_http_request(detail::connection_ptr<T> con) {
             try {
                auto& req = con->get_request();
 
@@ -281,23 +555,22 @@ namespace eosio {
                }
 
                con->append_header( "Content-type", "application/json" );
-               auto body = con->get_request_body();
-               auto resource = con->get_uri()->get_resource();
+               con->defer_http_response();
+
+               if( !verify_max_bytes_in_flight( con ) ) return;
+
+               std::string resource = con->get_uri()->get_resource();
                auto handler_itr = url_handlers.find( resource );
                if( handler_itr != url_handlers.end()) {
-                  con->defer_http_response();
-                  handler_itr->second( resource, body, [con]( auto code, auto&& body ) {
-                     con->set_body( std::move( body ));
-                     con->set_status( websocketpp::http::status_code::value( code ));
-                     con->send_http_response();
-                  } );
-
+                  std::string body = con->get_request_body();
+                  handler_itr->second( make_abstract_conn_ptr<T>(con, *this), std::move( resource ), std::move( body ), make_http_response_handler<T>(con) );
                } else {
-                  dlog( "404 - not found: ${ep}", ("ep", resource));
+                  fc_dlog( logger, "404 - not found: ${ep}", ("ep", resource) );
                   error_results results{websocketpp::http::status_code::not_found,
                                         "Not Found", error_results::error_info(fc::exception( FC_LOG_MESSAGE( error, "Unknown Endpoint" )), verbose_http_errors )};
-                  con->set_body( fc::json::to_string( results ));
+                  con->set_body( fc::json::to_string( results, fc::time_point::now() + max_response_time ));
                   con->set_status( websocketpp::http::status_code::not_found );
+                  con->send_http_response();
                }
             } catch( ... ) {
                handle_exception<T>( con );
@@ -308,18 +581,19 @@ namespace eosio {
          void create_server_for_endpoint(const tcp::endpoint& ep, websocketpp::server<detail::asio_with_stub_log<T>>& ws) {
             try {
                ws.clear_access_channels(websocketpp::log::alevel::all);
-               ws.init_asio(&app().get_io_service());
+               ws.init_asio( &thread_pool->get_executor() );
                ws.set_reuse_addr(true);
                ws.set_max_http_body_size(max_body_size);
+               // capture server_ioc shared_ptr in http handler to keep it alive while in use
                ws.set_http_handler([&](connection_hdl hdl) {
                   handle_http_request<detail::asio_with_stub_log<T>>(ws.get_con_from_hdl(hdl));
                });
             } catch ( const fc::exception& e ){
-               elog( "http: ${e}", ("e",e.to_detail_string()));
+               fc_elog( logger, "http: ${e}", ("e", e.to_detail_string()) );
             } catch ( const std::exception& e ){
-               elog( "http: ${e}", ("e",e.what()));
+               fc_elog( logger, "http: ${e}", ("e", e.what()) );
             } catch (...) {
-               elog("error thrown from http io service");
+               fc_elog( logger, "error thrown from http io service" );
             }
          }
 
@@ -328,42 +602,43 @@ namespace eosio {
             valid_hosts.emplace(host + ":" + port);
             valid_hosts.emplace(host + ":" + resolved_port_str);
          }
-
-         void mangle_option_names() {
-            if(current_http_plugin_defaults.address_config_prefix.empty())
-               return;
-            unix_socket_path_option_name.insert(0, current_http_plugin_defaults.address_config_prefix+"-");
-            http_server_address_option_name.insert(0, current_http_plugin_defaults.address_config_prefix+"-");
-            https_server_address_option_name.insert(0, current_http_plugin_defaults.address_config_prefix+"-");
-         }
    };
 
+#ifdef BOOST_ASIO_HAS_LOCAL_SOCKETS
    template<>
    bool http_plugin_impl::allow_host<detail::asio_local_with_stub_log>(const detail::asio_local_with_stub_log::request_type& req, websocketpp::server<detail::asio_local_with_stub_log>::connection_ptr con) {
       return true;
    }
+#endif
 
-   http_plugin::http_plugin():my(new http_plugin_impl()){}
+   http_plugin::http_plugin():my(new http_plugin_impl()){
+      app().register_config_type<https_ecdh_curve_t>();
+   }
    http_plugin::~http_plugin(){}
 
    void http_plugin::set_program_options(options_description&, options_description& cfg) {
-      my->mangle_option_names();
+#ifdef BOOST_ASIO_HAS_LOCAL_SOCKETS
       if(current_http_plugin_defaults.default_unix_socket_path.length())
          cfg.add_options()
-            (my->unix_socket_path_option_name.c_str(), bpo::value<string>()->default_value(current_http_plugin_defaults.default_unix_socket_path),
+            ("unix-socket-path", bpo::value<string>()->default_value(current_http_plugin_defaults.default_unix_socket_path),
              "The filename (relative to data-dir) to create a unix socket for HTTP RPC; set blank to disable.");
+      else
+         cfg.add_options()
+            ("unix-socket-path", bpo::value<string>(),
+             "The filename (relative to data-dir) to create a unix socket for HTTP RPC; set blank to disable.");   
+#endif
 
       if(current_http_plugin_defaults.default_http_port)
          cfg.add_options()
-            (my->http_server_address_option_name.c_str(), bpo::value<string>()->default_value("127.0.0.1:" + std::to_string(current_http_plugin_defaults.default_http_port)),
+            ("http-server-address", bpo::value<string>()->default_value("127.0.0.1:" + std::to_string(current_http_plugin_defaults.default_http_port)),
              "The local IP and port to listen for incoming http connections; set blank to disable.");
       else
          cfg.add_options()
-            (my->http_server_address_option_name.c_str(), bpo::value<string>(),
+            ("http-server-address", bpo::value<string>(),
              "The local IP and port to listen for incoming http connections; leave blank to disable.");
 
       cfg.add_options()
-            (my->https_server_address_option_name.c_str(), bpo::value<string>(),
+            ("https-server-address", bpo::value<string>(),
              "The local IP and port to listen for incoming https connections; leave blank to disable.")
 
             ("https-certificate-chain-file", bpo::value<string>(),
@@ -372,34 +647,52 @@ namespace eosio {
             ("https-private-key-file", bpo::value<string>(),
              "Filename with https private key in PEM format. Required for https")
 
+            ("https-ecdh-curve", bpo::value<https_ecdh_curve_t>()->notifier([this](https_ecdh_curve_t c) {
+               my->https_ecdh_curve = c;
+            })->default_value(SECP384R1),
+            "Configure https ECDH curve to use: secp384r1 or prime256v1")
+
             ("access-control-allow-origin", bpo::value<string>()->notifier([this](const string& v) {
                 my->access_control_allow_origin = v;
-                ilog("configured http with Access-Control-Allow-Origin: ${o}", ("o", my->access_control_allow_origin));
+                fc_ilog( logger, "configured http with Access-Control-Allow-Origin: ${o}",
+                         ("o", my->access_control_allow_origin) );
              }),
              "Specify the Access-Control-Allow-Origin to be returned on each request.")
 
             ("access-control-allow-headers", bpo::value<string>()->notifier([this](const string& v) {
                 my->access_control_allow_headers = v;
-                ilog("configured http with Access-Control-Allow-Headers : ${o}", ("o", my->access_control_allow_headers));
+                fc_ilog( logger, "configured http with Access-Control-Allow-Headers : ${o}",
+                         ("o", my->access_control_allow_headers) );
              }),
              "Specify the Access-Control-Allow-Headers to be returned on each request.")
 
             ("access-control-max-age", bpo::value<string>()->notifier([this](const string& v) {
                 my->access_control_max_age = v;
-                ilog("configured http with Access-Control-Max-Age : ${o}", ("o", my->access_control_max_age));
+                fc_ilog( logger, "configured http with Access-Control-Max-Age : ${o}",
+                         ("o", my->access_control_max_age) );
              }),
              "Specify the Access-Control-Max-Age to be returned on each request.")
 
             ("access-control-allow-credentials",
              bpo::bool_switch()->notifier([this](bool v) {
                 my->access_control_allow_credentials = v;
-                if (v) ilog("configured http with Access-Control-Allow-Credentials: true");
+                if( v ) fc_ilog( logger, "configured http with Access-Control-Allow-Credentials: true" );
              })->default_value(false),
              "Specify if Access-Control-Allow-Credentials: true should be returned on each request.")
-            ("max-body-size", bpo::value<uint32_t>()->default_value(1024*1024), "The maximum body size in bytes allowed for incoming RPC requests")
-            ("verbose-http-errors", bpo::bool_switch()->default_value(false), "Append the error log to HTTP responses")
-            ("http-validate-host", boost::program_options::value<bool>()->default_value(true), "If set to false, then any incoming \"Host\" header is considered valid")
-            ("http-alias", bpo::value<std::vector<string>>()->composing(), "Additionaly acceptable values for the \"Host\" header of incoming HTTP requests, can be specified multiple times.  Includes http/s_server_address by default.")
+            ("max-body-size", bpo::value<uint32_t>()->default_value(1024*1024),
+             "The maximum body size in bytes allowed for incoming RPC requests")
+            ("http-max-bytes-in-flight-mb", bpo::value<uint32_t>()->default_value(500),
+             "Maximum size in megabytes http_plugin should use for processing http requests. 503 error response when exceeded." )
+            ("http-max-response-time-ms", bpo::value<uint32_t>()->default_value(30),
+             "Maximum time for processing a request.")
+            ("verbose-http-errors", bpo::bool_switch()->default_value(false),
+             "Append the error log to HTTP responses")
+            ("http-validate-host", boost::program_options::value<bool>()->default_value(true),
+             "If set to false, then any incoming \"Host\" header is considered valid")
+            ("http-alias", bpo::value<std::vector<string>>()->composing(),
+             "Additionaly acceptable values for the \"Host\" header of incoming HTTP requests, can be specified multiple times.  Includes http/s_server_address by default.")
+            ("http-threads", bpo::value<uint16_t>()->default_value( my->thread_pool_size ),
+             "Number of worker threads in http thread pool")
             ;
    }
 
@@ -412,8 +705,8 @@ namespace eosio {
          }
 
          tcp::resolver resolver( app().get_io_service());
-         if( options.count( my->http_server_address_option_name ) && options.at( my->http_server_address_option_name ).as<string>().length()) {
-            string lipstr = options.at( my->http_server_address_option_name ).as<string>();
+         if( options.count( "http-server-address" ) && options.at( "http-server-address" ).as<string>().length()) {
+            string lipstr = options.at( "http-server-address" ).as<string>();
             string host = lipstr.substr( 0, lipstr.find( ':' ));
             string port = lipstr.substr( host.size() + 1, lipstr.size());
             tcp::resolver::query query( tcp::v4(), host.c_str(), port.c_str());
@@ -431,14 +724,16 @@ namespace eosio {
             }
          }
 
-         if( options.count( my->unix_socket_path_option_name ) && !options.at( my->unix_socket_path_option_name ).as<string>().empty()) {
-            boost::filesystem::path sock_path = options.at(my->unix_socket_path_option_name).as<string>();
+#ifdef BOOST_ASIO_HAS_LOCAL_SOCKETS
+         if( options.count( "unix-socket-path" ) && !options.at( "unix-socket-path" ).as<string>().empty()) {
+            boost::filesystem::path sock_path = options.at("unix-socket-path").as<string>();
             if (sock_path.is_relative())
                sock_path = app().data_dir() / sock_path;
             my->unix_endpoint = asio::local::stream_protocol::endpoint(sock_path.string());
          }
+#endif
 
-         if( options.count( my->https_server_address_option_name ) && options.at( my->https_server_address_option_name ).as<string>().length()) {
+         if( options.count( "https-server-address" ) && options.at( "https-server-address" ).as<string>().length()) {
             if( !options.count( "https-certificate-chain-file" ) ||
                 options.at( "https-certificate-chain-file" ).as<string>().empty()) {
                elog( "https-certificate-chain-file is required for HTTPS" );
@@ -450,7 +745,7 @@ namespace eosio {
                return;
             }
 
-            string lipstr = options.at( my->https_server_address_option_name ).as<string>();
+            string lipstr = options.at( "https-server-address" ).as<string>();
             string host = lipstr.substr( 0, lipstr.find( ':' ));
             string port = lipstr.substr( host.size() + 1, lipstr.size());
             tcp::resolver::query query( tcp::v4(), host.c_str(), port.c_str());
@@ -474,51 +769,65 @@ namespace eosio {
          my->max_body_size = options.at( "max-body-size" ).as<uint32_t>();
          verbose_http_errors = options.at( "verbose-http-errors" ).as<bool>();
 
+         my->thread_pool_size = options.at( "http-threads" ).as<uint16_t>();
+         EOS_ASSERT( my->thread_pool_size > 0, chain::plugin_config_exception,
+                     "http-threads ${num} must be greater than 0", ("num", my->thread_pool_size));
+
+         my->max_bytes_in_flight = options.at( "http-max-bytes-in-flight-mb" ).as<uint32_t>() * 1024 * 1024;
+         my->max_response_time = fc::microseconds( options.at("http-max-response-time-ms").as<uint32_t>() * 1000 );
+
          //watch out for the returns above when adding new code here
       } FC_LOG_AND_RETHROW()
    }
 
    void http_plugin::plugin_startup() {
+
+      handle_sighup(); // setup logging
+
+      my->thread_pool.emplace( "http", my->thread_pool_size );
+
       if(my->listen_endpoint) {
          try {
             my->create_server_for_endpoint(*my->listen_endpoint, my->server);
 
-            ilog("start listening for http requests");
+            fc_ilog( logger, "start listening for http requests" );
             my->server.listen(*my->listen_endpoint);
             my->server.start_accept();
          } catch ( const fc::exception& e ){
-            elog( "http service failed to start: ${e}", ("e",e.to_detail_string()));
+            fc_elog( logger, "http service failed to start: ${e}", ("e", e.to_detail_string()) );
             throw;
          } catch ( const std::exception& e ){
-            elog( "http service failed to start: ${e}", ("e",e.what()));
+            fc_elog( logger, "http service failed to start: ${e}", ("e", e.what()) );
             throw;
          } catch (...) {
-            elog("error thrown from http io service");
+            fc_elog( logger, "error thrown from http io service" );
             throw;
          }
       }
 
+#ifdef BOOST_ASIO_HAS_LOCAL_SOCKETS
       if(my->unix_endpoint) {
          try {
             my->unix_server.clear_access_channels(websocketpp::log::alevel::all);
-            my->unix_server.init_asio(&app().get_io_service());
+            my->unix_server.init_asio( &my->thread_pool->get_executor() );
             my->unix_server.set_max_http_body_size(my->max_body_size);
             my->unix_server.listen(*my->unix_endpoint);
-            my->unix_server.set_http_handler([&](connection_hdl hdl) {
+            my->unix_server.set_http_handler([&, &ioc = my->thread_pool->get_executor()](connection_hdl hdl) {
                my->handle_http_request<detail::asio_local_with_stub_log>( my->unix_server.get_con_from_hdl(hdl));
             });
             my->unix_server.start_accept();
          } catch ( const fc::exception& e ){
-            elog( "unix socket service failed to start: ${e}", ("e",e.to_detail_string()));
+            fc_elog( logger, "unix socket service (${path}) failed to start: ${e}", ("e", e.to_detail_string())("path",my->unix_endpoint->path()) );
             throw;
          } catch ( const std::exception& e ){
-            elog( "unix socket service failed to start: ${e}", ("e",e.what()));
+            fc_elog( logger, "unix socket service (${path}) failed to start: ${e}", ("e", e.what())("path",my->unix_endpoint->path()) );
             throw;
          } catch (...) {
-            elog("error thrown from unix socket io service");
+            fc_elog( logger, "error thrown from unix socket (${path}) io service", ("path",my->unix_endpoint->path()) );
             throw;
          }
       }
+#endif
 
       if(my->https_listen_endpoint) {
          try {
@@ -527,20 +836,37 @@ namespace eosio {
                return my->on_tls_init(hdl);
             });
 
-            ilog("start listening for https requests");
+            fc_ilog( logger, "start listening for https requests" );
             my->https_server.listen(*my->https_listen_endpoint);
             my->https_server.start_accept();
          } catch ( const fc::exception& e ){
-            elog( "https service failed to start: ${e}", ("e",e.to_detail_string()));
+            fc_elog( logger, "https service failed to start: ${e}", ("e", e.to_detail_string()) );
             throw;
          } catch ( const std::exception& e ){
-            elog( "https service failed to start: ${e}", ("e",e.what()));
+            fc_elog( logger, "https service failed to start: ${e}", ("e", e.what()) );
             throw;
          } catch (...) {
-            elog("error thrown from https io service");
+            fc_elog( logger, "error thrown from https io service" );
             throw;
          }
       }
+
+      add_api({{
+         std::string("/v1/node/get_supported_apis"),
+         [&](string, string body, url_response_callback cb) mutable {
+            try {
+               if (body.empty()) body = "{}";
+               auto result = (*this).get_supported_apis();
+               cb(200, fc::variant(result));
+            } catch (...) {
+               handle_exception("node", "get_supported_apis", body, cb);
+            }
+         }
+      }});
+   }
+
+   void http_plugin::handle_sighup() {
+      fc::logger::update( logger_name, logger );
    }
 
    void http_plugin::plugin_shutdown() {
@@ -548,15 +874,26 @@ namespace eosio {
          my->server.stop_listening();
       if(my->https_server.is_listening())
          my->https_server.stop_listening();
+#ifdef BOOST_ASIO_HAS_LOCAL_SOCKETS
       if(my->unix_server.is_listening())
          my->unix_server.stop_listening();
+#endif
+
+      if( my->thread_pool ) {
+         my->thread_pool->stop();
+      }
+
+      app().post( 0, [me = my](){} ); // keep my pointer alive until queue is drained
    }
 
-   void http_plugin::add_handler(const string& url, const url_handler& handler) {
-      ilog( "add api url: ${c}", ("c",url) );
-      app().get_io_service().post([=](){
-        my->url_handlers.insert(std::make_pair(url,handler));
-      });
+   void http_plugin::add_handler(const string& url, const url_handler& handler, int priority) {
+      fc_ilog( logger, "add api url: ${c}", ("c", url) );
+      my->url_handlers[url] = my->make_app_thread_url_handler(priority, handler);
+   }
+
+   void http_plugin::add_async_handler(const string& url, const url_handler& handler) {
+      fc_ilog( logger, "add api url: ${c}", ("c", url) );
+      my->url_handlers[url] = my->make_http_thread_url_handler(handler);
    }
 
    void http_plugin::handle_exception( const char *api_name, const char *call_name, const string& body, url_response_callback cb ) {
@@ -565,38 +902,40 @@ namespace eosio {
             throw;
          } catch (chain::unknown_block_exception& e) {
             error_results results{400, "Unknown Block", error_results::error_info(e, verbose_http_errors)};
-            cb( 400, fc::json::to_string( results ));
+            cb( 400, fc::variant( results ));
          } catch (chain::unsatisfied_authorization& e) {
             error_results results{401, "UnAuthorized", error_results::error_info(e, verbose_http_errors)};
-            cb( 401, fc::json::to_string( results ));
+            cb( 401, fc::variant( results ));
          } catch (chain::tx_duplicate& e) {
             error_results results{409, "Conflict", error_results::error_info(e, verbose_http_errors)};
-            cb( 409, fc::json::to_string( results ));
+            cb( 409, fc::variant( results ));
          } catch (fc::eof_exception& e) {
             error_results results{422, "Unprocessable Entity", error_results::error_info(e, verbose_http_errors)};
-            cb( 422, fc::json::to_string( results ));
-            elog( "Unable to parse arguments to ${api}.${call}", ("api", api_name)( "call", call_name ));
-            dlog("Bad arguments: ${args}", ("args", body));
+            cb( 422, fc::variant( results ));
+            fc_elog( logger, "Unable to parse arguments to ${api}.${call}", ("api", api_name)( "call", call_name ) );
+            fc_dlog( logger, "Bad arguments: ${args}", ("args", body) );
          } catch (fc::exception& e) {
             error_results results{500, "Internal Service Error", error_results::error_info(e, verbose_http_errors)};
-            cb( 500, fc::json::to_string( results ));
-            if (e.code() != chain::greylist_net_usage_exceeded::code_value && e.code() != chain::greylist_cpu_usage_exceeded::code_value) {
-               elog( "FC Exception encountered while processing ${api}.${call}",
-                     ("api", api_name)( "call", call_name ));
-               dlog( "Exception Details: ${e}", ("e", e.to_detail_string()));
+            cb( 500, fc::variant( results ));
+            if (e.code() != chain::greylist_net_usage_exceeded::code_value &&
+                e.code() != chain::greylist_cpu_usage_exceeded::code_value &&
+                e.code() != fc::timeout_exception::code_value ) {
+               fc_elog( logger, "FC Exception encountered while processing ${api}.${call}",
+                        ("api", api_name)( "call", call_name ) );
             }
+            fc_dlog( logger, "Exception Details: ${e}", ("e", e.to_detail_string()) );
          } catch (std::exception& e) {
             error_results results{500, "Internal Service Error", error_results::error_info(fc::exception( FC_LOG_MESSAGE( error, e.what())), verbose_http_errors)};
-            cb( 500, fc::json::to_string( results ));
-            elog( "STD Exception encountered while processing ${api}.${call}",
-                  ("api", api_name)( "call", call_name ));
-            dlog( "Exception Details: ${e}", ("e", e.what()));
+            cb( 500, fc::variant( results ));
+            fc_elog( logger, "STD Exception encountered while processing ${api}.${call}",
+                     ("api", api_name)( "call", call_name ) );
+            fc_dlog( logger, "Exception Details: ${e}", ("e", e.what()) );
          } catch (...) {
             error_results results{500, "Internal Service Error",
                error_results::error_info(fc::exception( FC_LOG_MESSAGE( error, "Unknown Exception" )), verbose_http_errors)};
-            cb( 500, fc::json::to_string( results ));
-            elog( "Unknown Exception encountered while processing ${api}.${call}",
-                  ("api", api_name)( "call", call_name ));
+            cb( 500, fc::variant( results ));
+            fc_elog( logger, "Unknown Exception encountered while processing ${api}.${call}",
+                     ("api", api_name)( "call", call_name ) );
          }
       } catch (...) {
          std::cerr << "Exception attempting to handle exception for " << api_name << "." << call_name << std::endl;
@@ -615,4 +954,40 @@ namespace eosio {
       return verbose_http_errors;
    }
 
+   http_plugin::get_supported_apis_result http_plugin::get_supported_apis()const {
+      get_supported_apis_result result;
+
+      for (const auto& handler : my->url_handlers) {
+         if (handler.first != "/v1/node/get_supported_apis")
+            result.apis.emplace_back(handler.first);
+      }
+
+      return result;
+   }
+
+   fc::microseconds http_plugin::get_max_response_time()const {
+      return my->max_response_time;
+   }
+
+   std::istream& operator>>(std::istream& in, https_ecdh_curve_t& curve) {
+      std::string s;
+      in >> s;
+      if (s == "secp384r1")
+         curve = SECP384R1;
+      else if (s == "prime256v1")
+         curve = PRIME256V1;
+      else
+         in.setstate(std::ios_base::failbit);
+      return in;
+   }
+
+   std::ostream& operator<<(std::ostream& osm, https_ecdh_curve_t curve) {
+      if (curve == SECP384R1) {
+         osm << "secp384r1";
+      } else if (curve == PRIME256V1) {
+         osm << "prime256v1";
+      }
+
+      return osm;
+   }
 }

@@ -1,7 +1,3 @@
-/**
- *  @file
- *  @copyright defined in eos/LICENSE
- */
 #pragma once
 
 #include <eosio/chain/types.hpp>
@@ -101,7 +97,7 @@ class wallet_api
 
       /** Returns a signature given the digest and public_key, if this wallet can sign via that public key
        */
-      virtual optional<signature_type> try_sign_digest( const digest_type digest, const public_key_type public_key ) = 0;
+      virtual fc::optional<signature_type> try_sign_digest( const digest_type digest, const public_key_type public_key ) = 0;
 };
 
 }}

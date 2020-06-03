@@ -1,7 +1,3 @@
-/**
- *  @file
- *  @copyright defined in eos/LICENSE
- */
 #include <eosio/history_api_plugin/history_api_plugin.hpp>
 #include <eosio/chain/exceptions.hpp>
 
@@ -24,8 +20,8 @@ void history_api_plugin::plugin_initialize(const variables_map&) {}
    [api_handle](string, string body, url_response_callback cb) mutable { \
           try { \
              if (body.empty()) body = "{}"; \
-             auto result = api_handle.call_name(fc::json::from_string(body).as<api_namespace::call_name ## _params>()); \
-             cb(200, fc::json::to_string(result)); \
+             fc::variant result( api_handle.call_name(fc::json::from_string(body).as<api_namespace::call_name ## _params>()) ); \
+             cb(200, std::move(result)); \
           } catch (...) { \
              http_plugin::handle_exception(#api_name, #call_name, body, cb); \
           } \

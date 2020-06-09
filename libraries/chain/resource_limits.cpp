@@ -40,7 +40,6 @@ void elastic_limit_parameters::validate()const {
 void resource_limits_state_object::update_virtual_cpu_limit( const resource_limits_config_object& cfg ) {
    //idump((average_block_cpu_usage.average()));
    virtual_cpu_limit = update_elastic_limit(virtual_cpu_limit, average_block_cpu_usage.average(), cfg.cpu_limit_parameters);
-   //idump((virtual_cpu_limit));
 }
 
 void resource_limits_state_object::update_virtual_net_limit( const resource_limits_config_object& cfg ) {

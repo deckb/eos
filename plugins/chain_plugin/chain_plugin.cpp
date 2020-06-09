@@ -126,6 +126,14 @@ using fc::flat_map;
 
 using boost::signals2::scoped_connection;
 
+struct account_key {
+   name account;
+   name permission;
+   public_key_type key;
+
+
+};
+
 class chain_plugin_impl {
 public:
    chain_plugin_impl()
@@ -156,6 +164,8 @@ public:
    fc::optional<vm_type>            wasm_runtime;
    fc::microseconds                 abi_serializer_max_time_us;
    fc::optional<bfs::path>          snapshot_path;
+   fc::optional<public_key_type>    replace_producer_keys;
+   std::vector<account_key>         replace_account_keys;
 
 
    // retained references to channels for easy publication
@@ -281,6 +291,8 @@ void chain_plugin::set_program_options(options_description& cli, options_descrip
           "In \"light\" mode all incoming blocks headers will be fully validated; transactions in those validated blocks will be trusted \n")
          ("disable-ram-billing-notify-checks", bpo::bool_switch()->default_value(false),
           "Disable the check which subjectively fails a transaction if a contract bills more RAM to another account within the context of a notification handler (i.e. when the receiver is not the code of the action).")
+         ("replace-account-key", bpo::value<vector<string>>()->composing(),
+           "Replace account key in the format <account name>:<permission>:<key>")
 #ifdef EOSIO_DEVELOPER
          ("disable-all-subjective-mitigations", bpo::bool_switch()->default_value(false),
           "Disable all subjective mitigations checks in the entire codebase.")
@@ -356,6 +368,7 @@ void chain_plugin::set_program_options(options_description& cli, options_descrip
          ("export-reversible-blocks", bpo::value<bfs::path>(),
            "export reversible block database in portable format into specified file and then exit")
          ("snapshot", bpo::value<bfs::path>(), "File to read Snapshot State from")
+         ("replace-producer-keys", bpo::value<string>(), "Replace producer keys") 
          ;
 
 }
@@ -776,6 +789,23 @@ void chain_plugin::plugin_initialize(const variables_map& options) {
 #ifdef EOSIO_DEVELOPER
       my->chain_config->disable_all_subjective_mitigations = options.at( "disable-all-subjective-mitigations" ).as<bool>();
 #endif
+
+      if( options.count( "replace-producer-keys" ) ) {
+         my->replace_producer_keys.emplace( options.at( "replace-producer-keys" ).as<string>() );
+      }
+
+      if( options.count( "replace-account-key") ) {
+         auto rak = options.at("replace-account-key").as<vector<string>>();
+         for(auto& s : rak) {
+            std::vector<std::string> v;
+            boost::split( v, s, boost::is_any_of( ":" ));
+            EOS_ASSERT( v.size() == 3, fc::invalid_arg_exception, "Invalid value ${s} for --replace-account-key", ("s", s));
+            account_key re{eosio::chain::name(v[0]), eosio::chain::name(v[1]), eosio::chain::public_key_type(v[2])};
+            EOS_ASSERT( re.account.to_uint64_t() && re.permission.to_uint64_t(), fc::invalid_arg_exception,
+                        "Invalid value ${s} for --replace-account-key", ("s", s));
+            my->replace_account_keys.push_back( re );
+         }
+      }
 
       my->chain_config->maximum_variable_signature_length = options.at( "maximum-variable-signature-length" ).as<uint32_t>();
 
@@ -1203,6 +1233,18 @@ void chain_plugin::plugin_startup()
       } else {
          my->chain->startup(shutdown, check_shutdown);
       }
+      ilog("replace: ${key}",("key", my->replace_producer_keys));
+      if (my->replace_producer_keys && !check_shutdown()) {
+         ilog("replacing producer keys");
+         my->chain->replace_producer_keys(*my->replace_producer_keys);
+      }
+      if(my->replace_account_keys.size() > 0) {
+         for(auto &act: my->replace_account_keys) {
+            ilog("replacing ${account}:${perm} with ${key}",("account", act.account)("perm", act.permission)("key", act.key));
+            my->chain->replace_account_keys(act.account, act.permission, act.key);
+         }
+      }
+
    } catch (const database_guard_exception& e) {
       log_guard_exception(e);
       // make sure to properly close the db
